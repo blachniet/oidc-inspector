@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OIDC Inspector</title>
+    <link rel="stylesheet" href="https://cdn.simplecss.org/simple.min.css">
+
+    <style>
+    input {
+      width: 100%;
+    }
+
+    .notice-danger {
+      color: #721c24;
+      background-color: #f8d7da;
+      border-color: #721c24;
+    }
+
+    [x-cloak] { display: none !important; }
+    </style>
+
+    <script defer src="https://cdn.jsdelivr.net/npm/@alpinejs/persist@3.x.x/dist/cdn.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body x-data="data">
+  <header>
+    <nav>
+      <a href="/">Home</a>
+    </nav>
+
+    <h1>OIDC Inspector</h1>
+    <p>Inspect tokens and endpoint responses that are part of an OpenID Connect flow.</p>
+
+  </header>
+
+  <main>
+
+    <div x-cloak x-show="showOutput">
+
+      <h2>💁‍♂️ Here's your tokens</h2>
+
+      <a class="button" href="/">Start Over</a>
+
+      <h3>Access Token</h3>
+      <pre><code x-text="accessToken"></code></pre>
+
+      <h3>ID Token</h3>
+      <pre><code x-text="idToken"></code></pre>
+
+      <h3>UserInfo</h3>
+      <pre><code x-text="userInfoSet ? JSON.stringify(userInfo, null, 2) : ''"></code></pre>
+
+    </div>
+
+    <h2>🔑 Authenticate</h2>
+
+    <p x-cloak x-show="error" class="notice notice-danger"><strong x-text="error"></strong>: <span x-text="errorDescription"></span></p>
+
+    <form @submit.prevent="authenticate">
+
+      <p>
+      <label>Client ID <em>- this needs to match the client ID configured in your identity provider</em></label>
+      <input x-model="clientID" />
+      </p>
+
+      <p>
+      <label>Scope</label>
+      <input x-model="scope" />
+      </p>
+
+      <p>
+      <label>
+        <input type="checkbox" x-model="useDiscoveryEndpoint" />
+        Use Discovery Endpoint</label>
+      </label>
+      </p>
+
+      <p>
+      <label>Discovery Endpoint</label>
+      <input x-model="discoveryEndpoint" x-bind:disabled="!useDiscoveryEndpoint" />
+      </p>
+
+      <div x-show="!useDiscoveryEndpoint" x-transition>
+        <p>
+        <label>Issuer</label>
+        <input x-model="issuer" />
+        </p>
+
+        <p>
+        <label>Auth Endpoint</label>
+        <input x-model="authEndpoint" />
+        </p>
+
+        <p>
+        <label>Token Endpoint</label>
+        <input x-model="tokenEndpoint" />
+        </p>
+
+        <p>
+        <label>UserInfo Endpoint</label>
+        <input x-model="userInfoEndpoint" />
+        </p>
+      </div>
+
+      <p>
+      <label>Response Type</label>
+      <input x-model="responseType" />
+      </p>
+
+      <p>
+      <label>PKCE Code Challenge Method</label>
+      <input x-model="codeChallengeMethod" />
+      </p>
+
+      <p>
+      <label>Redirect URI <em>- put this in the OAuth client configuration for this app in your identity provider</em></label>
+      <input x-model="redirectURI" readonly />
+      </p>
+
+      <button x-bind:disabled="!formEnabled">Authenticate</button>
+
+    </form>
+
+  </main>
+
+  <footer>
+    <p>by <a href="https://blachniet.com/">Brian Lachniet</a></p>
+  </footer>
+
+<script>
+/**
+ * Request UserInfo
+ * https://openid.net/specs/openid-connect-core-1_0.html#UserInfoRequest
+ */
+async function fetchUserInfo(accessToken, endpoint) {
+  const res = await fetch(endpoint, {
+    headers: {
+      'Accept': 'application/json',
+      'Authorization': 'Bearer ' + accessToken,
+    },
+  });
+
+  return {
+    ok: res.ok,
+    data: res.ok ? await res.json() : null,
+  };
+}
+
+function generateRandomString() {
+  // TODO: Implement a better method for generating a random string. I got the
+  // idea for this format from the authorization code format used by Keycloak.
+  return crypto.randomUUID() + '.' + crypto.randomUUID() + '.' + crypto.randomUUID();
+}
+
+function generatePKCECodes() {
+  // TODO: Support S256
+  const codeVerifier = generateRandomString();
+  const codeChallenge = codeVerifier;
+  return [codeVerifier, codeChallenge];
+}
+
+/** Retrieve tokens from the token endpoint */
+async function fetchTokens(tokenEndpoint, code, redirectURI, clientID, codeVerifier) {
+  const queryParams = new URLSearchParams();
+
+  queryParams.set('grant_type', 'authorization_code');
+  queryParams.set('code', code);
+  queryParams.set('redirect_uri', redirectURI);
+  queryParams.set('client_id', clientID);
+
+  if (codeVerifier) {
+    queryParams.set('code_verifier', codeVerifier);
+  }
+
+  const res = await fetch(tokenEndpoint, {
+    method: 'POST',
+    body: queryParams.toString(),
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  });
+
+  return res.json();
+}
+
+async function fetchOIDCConfiguration(endpoint) {
+  const res = await fetch(endpoint, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+    },
+  });
+
+  return {
+    ok: res.ok,
+    config: res.ok ? await res.json() : null,
+  };
+}
+
+document.addEventListener('alpine:init', () => {
+  const searchParams = new URLSearchParams(window.location.search 
+    ? window.location.search.replace(/^\?/, '')
+    : window.location.hash.replace(/^#/, '')
+  );
+  const authzCode = searchParams.get('code');
+
+  Alpine.data('data', function() {
+    return {
+      // Form inputs
+      clientID: this.$persist('oidc-inspector'),
+      scope: this.$persist('openid profile email'),
+      useDiscoveryEndpoint: this.$persist(true),
+      discoveryEndpoint: this.$persist(''),
+      issuer: this.$persist(''),
+      authEndpoint: this.$persist(''),
+      tokenEndpoint: this.$persist(''),
+      userInfoEndpoint: this.$persist(''),
+      responseType: this.$persist('code'),
+      codeChallengeMethod: this.$persist('plain'),
+
+      // URL inputs
+      error: searchParams.get('error'),
+      errorDescription: searchParams.get('error_description'),
+      accessToken: searchParams.get('access_token'),
+      idToken: searchParams.get('id_token'),
+
+      // Other
+      userInfo: '',
+      userInfoSet: false,
+      redirectURI: window.location.origin,
+
+      async init() {
+        // TODO: Validate nonce in ID Token.
+        // TODO: Validate ID Token JWT.
+        // TODO: Support "profiles" for saving settings.
+        // TODO: Support well-known endpoint.
+        // TODO: Support stacking error messages - replace alerts.
+        // TODO: "Pop" some of these value from local storage (e.g. nonce, state, codeVerifier)
+
+        // Validate the state.
+        const state = searchParams.get('state');
+        const savedState = localStorage.getItem('state');
+        if (state && state !== savedState) {
+          alert('state in URL does not match saved state');
+        }
+
+        // If there's an authorization code in the URL, use it to request
+        // tokens from the token endpoint.
+        if (authzCode) {
+          // Ensure that state was provided. As long as it was, we already
+          // validated it above.
+          if (!state) {
+            alert('missing state URL query');
+          }
+
+          try {
+            // Request tokens from the token endpoint.
+            // https://openid.net/specs/openid-connect-core-1_0.html#TokenRequest
+            // https://datatracker.ietf.org/doc/html/rfc7636#section-4.5
+            const codeVerifier = localStorage.getItem('codeVerifier');
+            const tokens = await fetchTokens(
+              this.tokenEndpoint, authzCode, this.redirectURI, this.clientID, codeVerifier
+            );
+
+            this.accessToken = tokens.access_token;
+            this.idToken = tokens.id_token;
+          } catch(err) {
+            alert('Error while fetching tokens. See Console and/or Network in Developer Tools');
+          }
+        }
+
+        // Request UserInfo
+        // https://openid.net/specs/openid-connect-core-1_0.html#UserInfoRequest
+        if (this.accessToken) {
+          try {
+            const { ok, data } = await fetchUserInfo(this.accessToken, this.userInfoEndpoint);
+            if (ok) {
+              this.userInfo = data;
+              this.userInfoSet = true;
+              showError = false;
+            } else {
+              alert('Error while fetching UserInfo. See Network in Developer Tools.');
+            }
+          } catch(err) {
+            console.error('fetchUserInfo err:', err);
+            alert('Error while fetching UserInfo. See Console and/or Network in Developer Tools.');
+          }
+        }
+      },
+
+      get showOutput() {
+        return !!authzCode || !!this.accessToken || !!this.idToken;
+      },
+
+      get formEnabled() {
+        const configSet = this.useDiscoveryEndpoint
+          ? !!this.discoveryEndpoint
+          : !!this.issuer && !!this.authEndpoint && !!this.tokenEndpoint && !!this.userInfoEndpoint;
+
+        return !!this.clientID && !!this.scope && configSet &&
+          !!this.responseType && !!this.codeChallengeMethod;
+      },
+
+      async getConfiguration() {
+        if (this.useDiscoveryEndpoint) {
+          try {
+            return fetchOIDCConfiguration(this.discoveryEndpoint);
+          } catch(err) {
+            console.error('fetchOIDCConfiguration err:', err);
+            alert('Error while fetching OpenID Connect configuration at the discovery endpoint. See Console and/or Network in Developer Tools.');
+          }
+        } else {
+          return {
+            ok: true,
+            config: {
+              issuer: this.issuer,
+              authorization_endpoint: this.authEndpoint,
+              userinfo_endpoint: this.userInfoEndpoint,
+              token_endpoint: this.tokenEndpoint,
+            },
+          };
+        }
+      },
+
+      async authenticate() {
+        const {ok, config} = await this.getConfiguration();
+        if (!ok) {
+          alert('Error while building OpenID Connect configuration. See Console and/or Network in Developer Tools.');
+          return;
+        }
+
+        // Alpine Persist requires that these are stored as JSON.
+        localStorage.setItem('_x_issuer', JSON.stringify(config.issuer));
+        localStorage.setItem('_x_authEndpoint', JSON.stringify(config.authorization_endpoint));
+        localStorage.setItem('_x_tokenEndpoint', JSON.stringify(config.token_endpoint));
+        localStorage.setItem('_x_userInfoEndpoint', JSON.stringify(config.userinfo_endpoint));
+
+        const nonce = generateRandomString();
+        const state = generateRandomString();
+        const [codeVerifier, codeChallenge] = generatePKCECodes();
+
+        localStorage.setItem('nonce', nonce);
+        localStorage.setItem('state', state);
+        localStorage.setItem('codeVerifier', codeVerifier);
+
+        const queryParams = new URLSearchParams();
+        queryParams.set('client_id', this.clientID);
+        queryParams.set('redirect_uri', this.redirectURI);
+        queryParams.set('scope', this.scope);
+        queryParams.set('response_type', this.responseType);
+        queryParams.set('nonce', nonce);
+        queryParams.set('state', state);
+        queryParams.set('code_challenge', codeChallenge);
+        queryParams.set('code_challenge_method', this.codeChallengeMethod);
+
+        window.location.assign(config.authorization_endpoint + '?' + queryParams.toString());
+      },
+    };
+  });
+});
+</script>
+</body>
+</html>
